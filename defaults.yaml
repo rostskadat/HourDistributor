@@ -1,0 +1,8 @@
+project-breakdown: project-breakdown.xls
+employee: alicia
+justification-period: monthly
+justification-granularity: 30
+output-dir: generated/${employee}
+project-name-column: project
+project-start-column: start
+project-end-column: end

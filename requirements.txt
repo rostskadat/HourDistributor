@@ -1,0 +1,6 @@
+PyYAML==6.0.1
+coloredlogs==15.0.1
+docxtpl==0.16.8 
+python-docx==1.1.0
+python-dotenv==1.0.1
+workalendar==17.0.0
