@@ -1,16 +1,52 @@
-employee: alicia
-justification-interval: monthly
-justification-granularity: .5
-output-dir: generated/${employee}
+#
+# Project breakdown related parameters
+#
+# project-breakdown: the name of the input Excel file containg the project breakdown
 project-breakdown: resources/project-breakdown.xlsx
+# project-name-column: the name of the column containing the project's name
 project-name-column: project
+# project-start-column: the name of the column containing the project's start date
 project-start-column: start
+# project-end-column: the name of the column containing the project's end date
 project-end-column: end
+# worksheet-report-template: the worksheet in the project breakdown Excel file containing the template used to generate the report
 worksheet-report-template: "report_template"
-date-format: "%d/%m/%Y"
+
+#
+# The employee for whom the justification sheet is to be generated. This must be the 
+#   name of a worksheet in the Excel file
+#
+employee: John Smith
+
+# justification-interval: the interval for which to generate the report. either month or week
+justification-interval: month
+# justification-granularity: the minimum time span in hours for which to justify hours. Note that if the time left for a project on a given interval is less than the justification-granularity, the whole remaining time will be justified.
+justification-granularity: .5
+
+# max-daily-limit: the maximum amount of time (in hour) that can be justified in one day. Used for sanity checks.
 max-daily-limit: 7.5
+# max-yearly-limit: the maximum amount of time (in hour) that can be justified in one year. Used for sanity checks.
 max-yearly-limit: 1433
-monthly-limit: monthly-average-by-project
-extra-holidays: 2024-01-02,2024-01-03,2024-01-04,2024-01-05
+
+# project-report: the name of the output report to be generated
 project-report: generated/report.xlsm
-project-report-project-style: 'ProjectHeader'
+
+# project-report-use-references: whether to use reference to link value to their original cell
+project-report-use-reference: false
+
+#
+# Report styles:
+#
+# project-report-project-style: the style to be used for the project name column
+project-report-project-style: 'StyleProjectName'
+
+# Some coloring configuration
+project-report-alert-color: 'FFC7CE'
+project-report-warning-color: 'FFE699'
+project-report-ok-color: 'C6E0B4'
+project-report-grey-color: 'E7E6E6'
+
+# extra-holidays: a comma separated list of extra holidays in format YYYY-MM-DD
+extra-holidays: 2024-01-02,2024-01-03,2024-01-04,2024-01-05
+
+
