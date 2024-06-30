@@ -46,7 +46,9 @@ project-report-warning-color: 'FFE699'
 project-report-ok-color: 'C6E0B4'
 project-report-grey-color: 'E7E6E6'
 
-# extra-holidays: a comma separated list of extra holidays in format YYYY-MM-DD
-extra-holidays: 2024-01-02,2024-01-03,2024-01-04,2024-01-05
+# university-holidays: a comma separated list of holidays in format YYYY-MM-DD specific to the university
+# employee-holidays: a comma separated list of extra holidays in format YYYY-MM-DD
+university-holidays: 2024-01-02,2024-01-03,2024-01-04,2024-01-05
+employee-holidays: 2024-08-01,2024-08-02,2024-08-03,2024-08-04,2024-08-05,2024-08-06,2024-08-07,2024-08-08,2024-08-09,2024-08-10,2024-08-11,2024-08-12,2024-08-13,2024-08-14
 
 
