@@ -70,6 +70,7 @@ try:
     from openpyxl.styles import NamedStyle, Font, Border, Side, Color, PatternFill, Protection
     from openpyxl.styles.differential import DifferentialStyle
     from openpyxl.cell.cell import Cell
+    from openpyxl.packaging.custom import (BoolProperty, DateTimeProperty, FloatProperty, IntProperty, LinkProperty, StringProperty, CustomPropertyList)
     from openpyxl.worksheet.worksheet import Worksheet
     from openpyxl.workbook.defined_name import DefinedName
     from openpyxl.utils import quote_sheetname, absolute_coordinate, get_column_letter, column_index_from_string
@@ -85,12 +86,14 @@ CELL_FMT = "0.0"  # "[h]:mm"
 PREFERRED_FMT = 'decimal'
 MONTH_INTERVAL = 'month'
 WEEK_INTERVAL = 'week'
+DEFAULT_LOCALE = 'es_ES'
 
 # The row containing the interval id
 INTERVAL_HEADER_ROW = 6
 # The first row containing project information
 PRJ_1ST_ROW = 7
 PRJ_NAME_COL = 'A'
+PRJ_NAME_COL_NUM = column_index_from_string(PRJ_NAME_COL)
 # The column containing the projected dedication for the given project
 PROJECTED_COL = 'B'
 # The column containing the Excel SUM of justified dedication for the given project
@@ -98,12 +101,12 @@ JUSTIFIED_COL = 'C'
 # The column containing the justified dedication for the given month / week
 MONTH_1ST_COL = 'D'
 MONTH_1ST_COL_NUM = column_index_from_string(MONTH_1ST_COL)
-MONTH_LST_COL = get_column_letter(column_index_from_string(MONTH_1ST_COL) + 12 - 1)
+MONTH_LST_COL = get_column_letter(MONTH_1ST_COL_NUM + 12 - 1)
 MONTH_LST_COL_NUM = column_index_from_string(MONTH_LST_COL)
 
 WEEK_1ST_COL = 'D'
 WEEK_1ST_COL_NUM = column_index_from_string(WEEK_1ST_COL)
-WEEK_LST_COL = get_column_letter(column_index_from_string(WEEK_1ST_COL) + 52 - 1)
+WEEK_LST_COL = get_column_letter(WEEK_1ST_COL_NUM + 52 - 1)
 WEEK_LST_COL_NUM = column_index_from_string(WEEK_LST_COL)
 
 
@@ -127,7 +130,7 @@ class Project:
 
     def __repr__(self) -> str:
         # , i={['{:.2f}'.format(i) for i in self.interval_limits]}
-        return f"<PRJ {self.name} ({f(self.start)}/{f(self.end)}, eoi/eoy/projected={self.justified_eoi}/{self.justified_eoy}/{self.projected})>"
+        return f"<PRJ {self.name} ({_f(self.start)}/{_f(self.end)}, eoi/eoy/projected={self.justified_eoi}/{self.justified_eoy}/{self.projected})>"
 
     def is_open(self, working_day: date) -> bool:
         """Returns whether a working day falls within a project
@@ -209,7 +212,7 @@ class Project:
         return min([available_this_year, available_this_month, available_today, granular_span])
 
 
-def f(object: date) -> str:
+def _f(object: date) -> str:
     if type(object) == type(date.today()) or type(object) == type(datetime.now()):
         return object.strftime(DEFAULT_FMT)
     return str(object)
@@ -219,20 +222,80 @@ def _get_cell_coordinate(worksheet, cell_range: str) -> str:
     return f"{quote_sheetname(worksheet.title)}!{absolute_coordinate(cell_range)}"
 
 
-def _load_justification_hints(worksheet: Worksheet, only_projects: list, justification_interval: str) -> dict:
-    """Returns existing justification for project found in a Worksheet
+def _load_project_justification_hints(worksheet: Worksheet, prj_row:int, justification_interval:str, justification_year:int, working_days: list) -> dict:
+    from_month = justification_interval == MONTH_INTERVAL
+    translate = False
+    ws_min_col = MONTH_1ST_COL_NUM if from_month else WEEK_1ST_COL_NUM
+    ws_max_col = MONTH_LST_COL_NUM if from_month else WEEK_LST_COL_NUM
+    
+    # Figure out whether it is a week or month report
+    interval_1st_header:str = worksheet[f"{get_column_letter(ws_min_col)}{INTERVAL_HEADER_ROW}"].value
+    if from_month:
+        if interval_1st_header.lower() != date.today().replace(month=1).strftime("%B").lower():
+            logger.warning(f"Worksheet '{worksheet.title}' is not a monthly report. Assuming a weekly report.")
+            ws_min_col = WEEK_1ST_COL_NUM
+            ws_max_col = WEEK_LST_COL_NUM
+            translate = True
+    else:
+        if not interval_1st_header.lower().startswith("semana"):
+            logger.warning(f"Worksheet '{worksheet.title}' is not a weekly report. Assuming a monthly report, data loss might occur.")
+            ws_min_col = MONTH_1ST_COL_NUM
+            ws_max_col = MONTH_LST_COL_NUM
+            translate = True
+
+    # Read the justified time for each interval
+    prj_hints = {}
+    for interval_col in worksheet.iter_cols(min_col=ws_min_col,
+                                            max_col=ws_max_col,
+                                            min_row=prj_row,
+                                            max_row=prj_row):
+        for interval_cell in interval_col:
+            # NOTE: internally work with minutes...
+            prj_hints[interval_cell.column - ws_min_col] = round(interval_cell.value * 60)
+
+    
+    if translate:
+        translated_hints = { i:0 for i in range (0, 12 if from_month else 52) }
+        # Take all working days determine each input interval and output interval
+        # NOTE: We do not take into account the start and end date of the project
+        #   as it has not been read yet... We however try to get the most accurate
+        #   translation when going from month to week (using the number of working
+        #   days in that month)
+        days_in_interval = { i:0 for i in range (0, 12) }
+        def _cumulate(working_day):
+            days_in_interval[working_day.month-1] += 1
+        list(map(_cumulate, working_days))
+        
+        for working_day in working_days:
+            if from_month:
+                intput_interval = working_day.isocalendar().week - 1
+                output_interval = working_day.month - 1
+                translated_hints[output_interval] += prj_hints[intput_interval]
+            else:
+                intput_interval = working_day.month - 1
+                output_interval = working_day.isocalendar().week - 1
+                translated_hints[output_interval] += prj_hints[intput_interval] / days_in_interval[intput_interval]
+        prj_hints = { k: int(round(v)) for k, v in translated_hints.items() }
+    return prj_hints
+
+
+def _load_justification_hints(worksheet: Worksheet, only_projects: list, justification_interval: str, justification_year:int, working_days: list) -> dict:
+    """Returns existing justification for project found in a report worksheet
 
     Args:
-        worksheet (Worksheet): the worksheet containing existing justification for a list of project. Must have been generated by this program
+        worksheet (Worksheet): the worksheet containing existing justification
+            for a list of project. Must have been generated by this script.
         only_projects (list): a list of project to filter on
+        justification_interval (str): indicating whether the justification 
+            interval is week or month.
 
     Returns:
-        dict: a map { project_name -> { month (zero_based) -> justified_eoi } }
+        dict: a map { project_name -> { interval (zero_based) -> justified_eoi } }
     """
     hints = {}
     # Look up the project name in column PRJ_NAME_COL from PRJ_1ST_ROW
-    for col in worksheet.iter_cols(min_col=1, max_col=1, min_row=PRJ_1ST_ROW):
-        for prj_cell in col:
+    for prj_col in worksheet.iter_cols(min_col=PRJ_NAME_COL_NUM, max_col=PRJ_NAME_COL_NUM, min_row=PRJ_1ST_ROW):
+        for prj_cell in prj_col:
             project_name = prj_cell.value
             if not project_name:
                 # Stop at the first empty row
@@ -243,19 +306,7 @@ def _load_justification_hints(worksheet: Worksheet, only_projects: list, justifi
                     f"Skipping hints for project '{project_name}' ...")
                 continue
             logger.debug(f"Loading hints for project '{project_name}' ...")
-            hints[project_name] = {}
-            # Then read the justified time for each interval
-            min_col = MONTH_1ST_COL_NUM if justification_interval == MONTH_INTERVAL else WEEK_1ST_COL_NUM
-            max_col = MONTH_LST_COL_NUM if justification_interval == MONTH_INTERVAL else WEEK_LST_COL_NUM
-            for interval_col in worksheet.iter_cols(min_col=min_col,
-                                                    max_col=max_col,
-                                                    min_row=prj_cell.row,
-                                                    max_row=prj_cell.row):
-                for interval_cell in interval_col:
-                    # NOTE: internally work with minutes...
-
-                    hints[project_name][interval_cell.column -
-                                        min_col] = round(interval_cell.value * 60)
+            hints[project_name] = _load_project_justification_hints(worksheet, prj_cell.row, justification_interval, justification_year, working_days)
     logger.debug(f"hints={pformat(hints)}")
     return hints
 
@@ -288,20 +339,24 @@ def _load_project_base_info(worksheet: Worksheet, employee: str, project_row: in
     return project
 
 
-def _get_project_working_days(project, working_days, max_daily_limit):
+def _get_project_working_days(project, working_days):
     project_working_days = list(
         filter(lambda d: project.start <= d and d <= project.end, working_days))
     if len(project_working_days) <= 0:
         raise ValueError(f"Invalid project breakdown: project '{project.name}' "
                          f"has projected dedication ({int(project.projected)}'), "
                          f"but no working days. It is configured to start on the "
-                         f"{f(project.start)} and finish on the {f(project.end)}.")
+                         f"{_f(project.start)} and finish on the {_f(project.end)}.")
+    return project_working_days
+
+
+def _get_project_daily_average(project, project_working_days, max_daily_limit):
     project_daily_average = project.projected / len(project_working_days)
     if project_daily_average > max_daily_limit:
         raise ValueError(f"Invalid project breakdown: project '{project.name}' "
                          f"has daily average ({project_daily_average}) which is "
                          f"greater than the max daily limit ({max_daily_limit})")
-    return project_working_days, project_daily_average
+    return project_daily_average
 
 
 def _get_interval_dates(justification_year: int, justification_interval: str, i: int):
@@ -331,11 +386,11 @@ def _set_interval_limit(project, project_working_days, hints, start, end, curren
     interval_limit = int(round(_get_interval_limit(
         project_working_days, start, end, project_daily_average)))
     # BUG: The hints are on a month basis. this is not working when using week interval
-    hint = hints.get(project.name, {}).get(current_interval, None)
-    if hint:
+    hint = hints.get(project.name, {}).get(current_interval, -1)
+    if hint != -1:
         # If an hint was specified, *must* respect it.
         logger.debug(
-            f"Overriding default dedication for project {project.name} for {f(start)}: from {interval_limit} to {hint}")
+            f"Overriding default dedication for project {project.name} for {_f(start)}: from {interval_limit} to {hint}")
         project.respect_hints = True
         project.interval_limits[current_interval] = hint
     else:
@@ -385,8 +440,11 @@ def _load_project_breakdown(project_breakdown_filename: str,
         if hint_worksheet_name in workbook:
             logger.debug(
                 f"Will use justification hints found in worksheet '{hint_worksheet_name}' ...")
-            hints = _load_justification_hints(
-                workbook[hint_worksheet_name], only_projects, justification_interval)
+            hints = _load_justification_hints(workbook[hint_worksheet_name], 
+                                              only_projects, 
+                                              justification_interval, 
+                                              justification_year,
+                                              working_days)
         else:
             logger.warning(
                 f"You requested to use hints, but no worksheet named '{hint_worksheet_name}' was found. Skipping hints altogether.")
@@ -432,8 +490,8 @@ def _load_project_breakdown(project_breakdown_filename: str,
         # The project has some projected dedication for the justification_year
         if project.projected > 0:
             logger.debug(f"Loading config for project '{project.name}' ...")
-            project_working_days, project_daily_average = _get_project_working_days(
-                project, working_days, max_daily_limit)
+            project_working_days = _get_project_working_days(project, working_days)
+            project_daily_average = _get_project_daily_average(project, project_working_days, max_daily_limit)
 
             if justification_interval == MONTH_INTERVAL:
                 number_of_interval = 12
@@ -451,7 +509,7 @@ def _load_project_breakdown(project_breakdown_filename: str,
                     justification_year, justification_interval, i)
                 if not project.is_open(start) and not project.is_open(end):
                     logger.debug(
-                        f"Project '{project.name}' is not opened in interval {f(start)} / {f(end)}. Skipping hints ...")
+                        f"Project '{project.name}' is not opened in interval {_f(start)} / {_f(end)}. Skipping hints ...")
                     continue
                 _set_interval_limit(
                     project, project_working_days, hints, start, end, i, project_daily_average)
@@ -513,7 +571,7 @@ def _get_working_days(justification_start, holidays):
     working_days = []
     for delta_day in (range(1, 367 if calendar.isleap(justification_start.year) else 366)):
         target_day = january_first + timedelta(days=delta_day)
-        if work_calendar.is_working_day(target_day) and f(target_day) not in holidays:
+        if work_calendar.is_working_day(target_day) and _f(target_day) not in holidays:
             working_days.append(target_day)
     return working_days, work_calendar
 
@@ -697,8 +755,8 @@ def _generate_report(employee, project_breakdown: str, projects: dict, working_d
     first = date.today().replace(year=justification_year, month=1, day=1)
     for i in range(1, max_range+1):
         interval_column = _get_interval_col(interval_1st_col, i)
-        title = first.replace(month=i).strftime("%B") if justification_interval == MONTH_INTERVAL else f"Week {i}"
-        _set_cell_to_title(report[f"{interval_column}{INTERVAL_HEADER_ROW}"], title, defaults)
+        title = first.replace(month=i).strftime("%B") if justification_interval == MONTH_INTERVAL else f"Semana {i}"
+        _set_cell_to_title(report[f"{interval_column}{INTERVAL_HEADER_ROW}"], title.title(), defaults)
     try:
         for cell in report[f"{INTERVAL_HEADER_ROW}:{INTERVAL_HEADER_ROW}"]:
             cell.style = defaults['project-report-interval-title-style']
@@ -832,6 +890,8 @@ def _generate_report(employee, project_breakdown: str, projects: dict, working_d
 
 
 def distribute_hours(args):
+    locale.setlocale(locale.LC_ALL, DEFAULT_LOCALE)
+
     # We interanlly work with minutes.
     MAX_DAILY_LIMIT = float(args.defaults['max-daily-limit'])*60
     MAX_YEARLY_LIMIT = float(args.defaults['max-yearly-limit'])*60
@@ -863,7 +923,7 @@ def distribute_hours(args):
                                        args.defaults)
 
     logger.info(f"Justifying '{args.justification_interval}' interval "
-                f"from '{f(justification_start)}' to '{f(justification_end)}' ...")
+                f"from '{_f(justification_start)}' to '{_f(justification_end)}' ...")
     logger.debug(
         f"{str(justification_year)} has {len(working_days)} working day(s)")
 
@@ -887,7 +947,7 @@ def distribute_hours(args):
         open_projects = list(filter(lambda p: p.is_open(
             working_day) and not p.is_full(current_interval), projects.values()))
         if len(open_projects) == 0:
-            logger.debug(f"No project left opened on {f(working_day)}")
+            logger.debug(f"No project left opened on {_f(working_day)}")
             continue
         # daily_dedication: time already justified for that day
         daily_dedication = 0
@@ -897,11 +957,11 @@ def distribute_hours(args):
             project, available = _pick_best_open_project(
                 open_projects, current_interval, MAX_DAILY_LIMIT - daily_dedication, granularity)
             if not project:
-                logger.debug(f"No more time can be justified on {f(working_day)}."
+                logger.debug(f"No more time can be justified on {_f(working_day)}."
                              "Skipping to next day.")
                 break
             logger.debug(
-                f"Adding {available}' to project {project.name} on {f(working_day)}")
+                f"Adding {available}' to project {project.name} on {_f(working_day)}")
 
             daily_dedication += available
             project.justified_eoi += available
@@ -916,7 +976,7 @@ def distribute_hours(args):
         working_day) and not p.is_full(current_interval), projects.values()))
     if len(open_projects) != 0 and _is_last_business_day_in_month(working_day):
         logger.warning(
-            f"Reached the end of the month with some project left opened {f(working_day)}")
+            f"Reached the end of the month with some project left opened {_f(working_day)}")
 
     logger.debug(f"daily_dedications={pformat(daily_dedications)}")
 
@@ -942,7 +1002,7 @@ def parse_command_line(defaults):
     parser.add_argument(
         '--employee', help=f"The employee to justify hours for. Note that the project breakdown file must contain a worksheet whose name is equal to the employee's name. By default '{defaults['employee']}'.", required=False, default=defaults['employee'])
     parser.add_argument(
-        '--justification-period', type=lambda s: datetime.strptime(s, DEFAULT_FMT), help=f"The justification period in '{DEFAULT_FMT}' format. By default today's date.", required=False, default=f(date.today()))
+        '--justification-period', type=lambda s: datetime.strptime(s, DEFAULT_FMT), help=f"The justification period in '{DEFAULT_FMT}' format. By default today's date.", required=False, default=_f(date.today()))
     parser.add_argument(
         '--justification-interval', help=f"The justification interval. Either 'month' or 'week'. By default '{defaults['justification-interval']}'.", required=False, default=defaults['justification-interval'])
     parser.add_argument(
