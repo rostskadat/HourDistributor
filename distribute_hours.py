@@ -88,7 +88,7 @@ CELL_FMT = "0.0"  # "[h]:mm"
 PREFERRED_FMT = 'decimal'
 MONTH_INTERVAL = 'month'
 WEEK_INTERVAL = 'week'
-DEFAULT_LOCALE = 'es_ES'
+DEFAULT_LOCALE = 'es_ES.utf8'
 
 # The row containing the interval id
 INTERVAL_HEADER_ROW = 6
