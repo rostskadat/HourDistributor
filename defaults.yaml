@@ -37,8 +37,9 @@ project-report-use-reference: false
 #
 # Report styles:
 #
-# project-report-project-style: the style to be used for the project name column
-project-report-project-style: 'StyleProjectName'
+# project-report-project-name-style: the style to be used for the project name column
+project-report-project-name-style: 'StyleProjectName'
+project-report-interval-title-style: 'ReportHeader'
 
 # Some coloring configuration
 project-report-alert-color: 'FFC7CE'

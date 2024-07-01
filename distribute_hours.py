@@ -12,19 +12,22 @@ The process is composed of different steps:
        justification interval is set to 'week' the yearly projected 
        dedication will be split evenly into 52 intervals. Note that the 
        refined projected dedication can be adjusted by the user and picked 
-       up by the script using the '--use-refined-projected-dedication' 
-       parameter.
+       up by the script using the '--use-justification-hints' parameter.
+       This parameter instruct the script to load the justified dedication 
+       from a previsouly generated report and use them to create the new 
+       report.
     3. Once the projected dedication has been refined for each justification
        interval, the script will start filling in each day of said interval 
        with the projects' projected dedication that are opened for that
        specific day, taking care of not breaching the limits imposed at 
-       different level (yearly, monthly, by project, etc.).
+       different level (yearly, monthly, by project, etc.), and also making
+       sure that potential justification hints are respected for that project.
     4. Once the dedication has been established for the justification interval
        the script generate a report with the details of the justification for 
        the given justification interval, as well as a daily justification 
-       sheet
+       sheet.
 
-NOTE: The script relies heavily on the fact that the input excel file has a 
+NOTE: The script relies heavily on the fact that the input Excel file has a 
       valid format. Do not modify the input Excel format without changing the
       corresponding parameter in the 'defauls.yaml' file.
 
@@ -47,10 +50,11 @@ try:
     from dotenv import load_dotenv
     from enum import Enum
     from functools import cmp_to_key
- 
+
     import time
     import calendar
     import coloredlogs
+    import locale
     import logging
     import math
     import os
@@ -68,7 +72,7 @@ try:
     from openpyxl.cell.cell import Cell
     from openpyxl.worksheet.worksheet import Worksheet
     from openpyxl.workbook.defined_name import DefinedName
-    from openpyxl.utils import quote_sheetname, absolute_coordinate
+    from openpyxl.utils import quote_sheetname, absolute_coordinate, get_column_letter, column_index_from_string
 except ModuleNotFoundError as e:
     print(f"{e}. Did you load your environment?")
     sys.exit(1)
@@ -77,12 +81,13 @@ load_dotenv()
 logger = logging.getLogger()
 
 DEFAULT_FMT = '%Y-%m-%d'
-CELL_FMT = "0.0" # "[h]:mm"
+CELL_FMT = "0.0"  # "[h]:mm"
 PREFERRED_FMT = 'decimal'
 MONTH_INTERVAL = 'month'
 WEEK_INTERVAL = 'week'
 
-
+# The row containing the interval id
+INTERVAL_HEADER_ROW = 6
 # The first row containing project information
 PRJ_1ST_ROW = 7
 PRJ_NAME_COL = 'A'
@@ -90,17 +95,22 @@ PRJ_NAME_COL = 'A'
 PROJECTED_COL = 'B'
 # The column containing the Excel SUM of justified dedication for the given project
 JUSTIFIED_COL = 'C'
-# The column containing the justified dedication for the given month
+# The column containing the justified dedication for the given month / week
 MONTH_1ST_COL = 'D'
-MONTH_1ST_COL_NUM = ord(MONTH_1ST_COL) - ord('A') + 1
-MONTH_LST_COL = chr(ord(MONTH_1ST_COL) + 12 - 1)
-MONTH_LST_COL_NUM = ord(MONTH_LST_COL) - ord('A') + 1
+MONTH_1ST_COL_NUM = column_index_from_string(MONTH_1ST_COL)
+MONTH_LST_COL = get_column_letter(column_index_from_string(MONTH_1ST_COL) + 12 - 1)
+MONTH_LST_COL_NUM = column_index_from_string(MONTH_LST_COL)
+
+WEEK_1ST_COL = 'D'
+WEEK_1ST_COL_NUM = column_index_from_string(WEEK_1ST_COL)
+WEEK_LST_COL = get_column_letter(column_index_from_string(WEEK_1ST_COL) + 52 - 1)
+WEEK_LST_COL_NUM = column_index_from_string(WEEK_LST_COL)
 
 
 class Project:
-    """Base class to all projects"""
+    """Represents a Project to be justified"""
 
-    def __init__(self, name:str, start:date, end:date):
+    def __init__(self, name: str, start: date, end: date):
         self.name = name
         self.name_coord = None
         self.start = start
@@ -114,11 +124,12 @@ class Project:
 
     def __str__(self) -> str:
         return self.__repr__()
-    
+
     def __repr__(self) -> str:
-        return f"<PRJ {self.name} ({f(self.start)}/{f(self.end)}, eoi/eoy/projected={self.justified}/{self.justified_eoy}/{self.projected})>" # , i={['{:.2f}'.format(i) for i in self.interval_limits]}
-    
-    def is_open(self, working_day:date) -> bool:
+        # , i={['{:.2f}'.format(i) for i in self.interval_limits]}
+        return f"<PRJ {self.name} ({f(self.start)}/{f(self.end)}, eoi/eoy/projected={self.justified_eoi}/{self.justified_eoy}/{self.projected})>"
+
+    def is_open(self, working_day: date) -> bool:
         """Returns whether a working day falls within a project
 
         Args:
@@ -128,18 +139,18 @@ class Project:
             bool: True if the working day falls within a project
         """
         return self.start <= working_day and working_day <= self.end
-    
-    def is_full(self, current_interval:int) -> bool:
+
+    def is_full(self, current_interval: int) -> bool:
         """Returns whether the project has used up all its projected dedication
 
         Returns:
             bool: True if no more time can be dedicated to the project
         """
         # TODO: Not true when using week interval
-        assert 1 <= current_interval and current_interval <= 12, "current_interval must be a datetime month (from 1 to 12)"
-        return ((self.justified >= self.projected) or (self.justified >= self.interval_limits[current_interval-1]))
-    
-    def get_availability(self, available_today:int, granularity:int, current_interval:int) -> int:
+        # assert 1 <= current_interval and current_interval <= 12, "current_interval must be a datetime month (from 1 to 12)"
+        return ((self.justified_eoi >= self.projected) or (self.justified_eoi >= self.interval_limits[current_interval-1]))
+
+    def get_availability(self, available_today: int, granularity: int, current_interval: int) -> int:
         """Returns the maximum number of minute that can be dedicated by the project taking into account different limits.
 
         Args:
@@ -182,31 +193,33 @@ class Project:
         +------------>   available_today
         +         +      granular_span
         +----------->    project.available
-        
+
         Returns:
             int: the number of minutes
         """
         # TODO: Not true when using week interval
-        assert 1 <= current_interval and current_interval <= 12, "current_month must be a datetime month (from 1 to 12)"
+        # assert 1 <= current_interval and current_interval <= 12, "current_month must be a datetime month (from 1 to 12)"
         if current_interval == 12 and self.name == 'TREASURE _ WP7':
             logger.debug("Should debug...")
         available_this_year = self.projected - self.justified_eoy
-        available_this_month = self.interval_limits[current_interval-1] - self.justified
-        granular_span = max(math.ceil(min([available_this_year, available_this_month, available_today]) / granularity), 1) * granularity
+        available_this_month = self.interval_limits[current_interval -
+                                                    1] - self.justified_eoi
+        granular_span = max(math.ceil(min(
+            [available_this_year, available_this_month, available_today]) / granularity), 1) * granularity
         return min([available_this_year, available_this_month, available_today, granular_span])
 
 
-def f(object:date) -> str:
-    if type(object) == type(date.today()) or type(object) == type (datetime.now()):
+def f(object: date) -> str:
+    if type(object) == type(date.today()) or type(object) == type(datetime.now()):
         return object.strftime(DEFAULT_FMT)
     return str(object)
 
 
-def _get_cell_coordinate(worksheet, cell_range:str) -> str:
+def _get_cell_coordinate(worksheet, cell_range: str) -> str:
     return f"{quote_sheetname(worksheet.title)}!{absolute_coordinate(cell_range)}"
 
 
-def _load_justification_hints(worksheet:Worksheet, only_projects:list) -> dict:
+def _load_justification_hints(worksheet: Worksheet, only_projects: list, justification_interval: str) -> dict:
     """Returns existing justification for project found in a Worksheet
 
     Args:
@@ -214,7 +227,7 @@ def _load_justification_hints(worksheet:Worksheet, only_projects:list) -> dict:
         only_projects (list): a list of project to filter on
 
     Returns:
-        dict: a map { project_name -> { month (zero_based) -> justified } }
+        dict: a map { project_name -> { month (zero_based) -> justified_eoi } }
     """
     hints = {}
     # Look up the project name in column PRJ_NAME_COL from PRJ_1ST_ROW
@@ -226,43 +239,87 @@ def _load_justification_hints(worksheet:Worksheet, only_projects:list) -> dict:
                 break
             if only_projects and project_name not in only_projects:
                 # And filter out skipped projects
-                logger.debug(f"Skipping hints for project '{project_name}' ...")
+                logger.debug(
+                    f"Skipping hints for project '{project_name}' ...")
                 continue
             logger.debug(f"Loading hints for project '{project_name}' ...")
             hints[project_name] = {}
-            # Then read the justified time for each month
-            for month_col in worksheet.iter_cols(min_col=MONTH_1ST_COL_NUM, 
-                                                 max_col=MONTH_LST_COL_NUM, 
-                                                 min_row=prj_cell.row, 
-                                                 max_row=prj_cell.row):
-                for month_cell in month_col:
+            # Then read the justified time for each interval
+            min_col = MONTH_1ST_COL_NUM if justification_interval == MONTH_INTERVAL else WEEK_1ST_COL_NUM
+            max_col = MONTH_LST_COL_NUM if justification_interval == MONTH_INTERVAL else WEEK_LST_COL_NUM
+            for interval_col in worksheet.iter_cols(min_col=min_col,
+                                                    max_col=max_col,
+                                                    min_row=prj_cell.row,
+                                                    max_row=prj_cell.row):
+                for interval_cell in interval_col:
                     # NOTE: internally work with minutes...
-                    hints[project_name][month_cell.column-MONTH_1ST_COL_NUM] = round(month_cell.value * 60)
+
+                    hints[project_name][interval_cell.column -
+                                        min_col] = round(interval_cell.value * 60)
     logger.debug(f"hints={pformat(hints)}")
     return hints
 
 
-def _load_project_base_info(worksheet:Worksheet, employee:str, project_row:int, name_col_idx:int, start_col_idx:int, end_col_idx:int, year_columns:list, justification_year:int, only_projects:list):
+def _load_project_base_info(worksheet: Worksheet, employee: str, project_row: int, name_col_idx: int, start_col_idx: int, end_col_idx: int, year_columns: list, justification_year: int, only_projects: list):
     name_cell = worksheet.cell(row=project_row, column=name_col_idx)
-    
+
     if only_projects and name_cell.value not in only_projects:
         logger.debug(f"Skipping config for project '{name_cell.value}' ...")
         return None
-    
+
     start_cell = worksheet.cell(row=project_row, column=start_col_idx)
     end_cell = worksheet.cell(row=project_row, column=end_col_idx)
-    projected_cell = worksheet.cell(row=project_row, column=year_columns[justification_year])
+    projected_cell = worksheet.cell(
+        row=project_row, column=year_columns[justification_year])
     if not projected_cell.value:
         projected_cell.value = 0.0
-    assert type(start_cell.value) == type(datetime.now()), f"Invalid type detected for cell '{employee}!{start_cell.coordinate}'. Expected a date."
-    assert type(end_cell.value) == type(datetime.now()), f"Invalid type detected for cell '{employee}!{end_cell.coordinate}'. Expected a date."
-    assert type(projected_cell.value) == type(0.0) or type(projected_cell.value) == type(0), f"Invalid type detected for cell '{employee}!{projected_cell.coordinate}'. Expected a float or an int."
+    assert type(start_cell.value) == type(datetime.now(
+    )), f"Invalid type detected for cell '{employee}!{start_cell.coordinate}'. Expected a date."
+    assert type(end_cell.value) == type(datetime.now(
+    )), f"Invalid type detected for cell '{employee}!{end_cell.coordinate}'. Expected a date."
+    assert type(projected_cell.value) == type(0.0) or type(projected_cell.value) == type(
+        0), f"Invalid type detected for cell '{employee}!{projected_cell.coordinate}'. Expected a float or an int."
     project = Project(str(name_cell.value), start_cell.value, end_cell.value)
     project.name_coord = _get_cell_coordinate(worksheet, name_cell.coordinate)
     # NOTE: internally work with minutes...
     project.projected = projected_cell.value * 60
-    project.projected_coord = _get_cell_coordinate(worksheet, projected_cell.coordinate)
+    project.projected_coord = _get_cell_coordinate(
+        worksheet, projected_cell.coordinate)
     return project
+
+
+def _get_project_working_days(project, working_days, max_daily_limit):
+    project_working_days = list(
+        filter(lambda d: project.start <= d and d <= project.end, working_days))
+    if len(project_working_days) <= 0:
+        raise ValueError(f"Invalid project breakdown: project '{project.name}' "
+                         f"has projected dedication ({int(project.projected)}'), "
+                         f"but no working days. It is configured to start on the "
+                         f"{f(project.start)} and finish on the {f(project.end)}.")
+    project_daily_average = project.projected / len(project_working_days)
+    if project_daily_average > max_daily_limit:
+        raise ValueError(f"Invalid project breakdown: project '{project.name}' "
+                         f"has daily average ({project_daily_average}) which is "
+                         f"greater than the max daily limit ({max_daily_limit})")
+    return project_working_days, project_daily_average
+
+
+def _get_interval_dates(justification_year: int, justification_interval: str, i: int):
+    if justification_interval == MONTH_INTERVAL:
+        assert 0 <= i and i < 12, "i must be between 0 and 12 when using {justification_interval} interval"
+        start = datetime(justification_year, i+1, 1, 0, 0)
+        end = start + relativedelta(months=+1, days=-1)
+    elif justification_interval == WEEK_INTERVAL:
+        assert 0 <= i and i < 52, "i must be between 0 and 52 when using {justification_interval} interval"
+        first_weekday = datetime(justification_year, 1, 1, 0, 0)
+        if first_weekday.weekday() > 4:
+            first_weekday += relativedelta(days=7-first_weekday.weekday())
+        start = first_weekday + relativedelta(days=7*i)
+        end = first_weekday + relativedelta(days=7*i+6)
+    else:
+        raise ValueError(
+            f"Invalid '--justification-interval' parameter. Must be either 'month' or 'week'.")
+    return start, end
 
 
 def _get_interval_limit(days, start, end, daily_average):
@@ -270,13 +327,28 @@ def _get_interval_limit(days, start, end, daily_average):
     return len(interval_days) * daily_average
 
 
-def _load_project_breakdown(project_breakdown_filename:str, 
-                            employee:str, 
-                            only_projects:str, 
-                            justification_interval:str, 
-                            use_justification_hints:bool, 
-                            justification_year:int, 
-                            working_days:list, 
+def _set_interval_limit(project, project_working_days, hints, start, end, current_interval, project_daily_average):
+    interval_limit = int(round(_get_interval_limit(
+        project_working_days, start, end, project_daily_average)))
+    # BUG: The hints are on a month basis. this is not working when using week interval
+    hint = hints.get(project.name, {}).get(current_interval, None)
+    if hint:
+        # If an hint was specified, *must* respect it.
+        logger.debug(
+            f"Overriding default dedication for project {project.name} for {f(start)}: from {interval_limit} to {hint}")
+        project.respect_hints = True
+        project.interval_limits[current_interval] = hint
+    else:
+        project.interval_limits[current_interval] = interval_limit
+
+
+def _load_project_breakdown(project_breakdown_filename: str,
+                            employee: str,
+                            only_projects: str,
+                            justification_interval: str,
+                            use_justification_hints: bool,
+                            justification_year: int,
+                            working_days: list,
                             defaults) -> dict:
     """Returns a dict containing information about the projects for the given employee
 
@@ -298,21 +370,26 @@ def _load_project_breakdown(project_breakdown_filename:str,
         { project_name -> Project (project_name, start, end, interval_limits, justified, projected)
 
     """
-    logger.info(f"Loading projects breakdown from {project_breakdown_filename} for '{employee}' ...")
+    logger.info(
+        f"Loading projects breakdown from {project_breakdown_filename} for '{employee}' ...")
     workbook = openpyxl.load_workbook(project_breakdown_filename)
     if employee not in workbook:
-        raise ValueError(f"Invalid '--employee' parameter: No worksheet '{employee}' found in {project_breakdown_filename}.")
+        raise ValueError(
+            f"Invalid '--employee' parameter: No worksheet '{employee}' found in {project_breakdown_filename}.")
 
     only_projects = only_projects.split(",") if only_projects else None
 
     hints = {}
     if use_justification_hints:
-        hint_worksheet_name = f"{employee} - {justification_year}" 
+        hint_worksheet_name = f"{employee} - {justification_year}"
         if hint_worksheet_name in workbook:
-            logger.debug(f"Will use justification hints found in worksheet '{hint_worksheet_name}' ...")
-            hints = _load_justification_hints(workbook[hint_worksheet_name], only_projects)
+            logger.debug(
+                f"Will use justification hints found in worksheet '{hint_worksheet_name}' ...")
+            hints = _load_justification_hints(
+                workbook[hint_worksheet_name], only_projects, justification_interval)
         else:
-            logger.warning(f"You requested to use hints, but no worksheet named '{hint_worksheet_name}' was found. Skipping hints altogether.")
+            logger.warning(
+                f"You requested to use hints, but no worksheet named '{hint_worksheet_name}' was found. Skipping hints altogether.")
 
     worksheet = workbook[employee]
     # determining the column indexes for each relevant column
@@ -332,20 +409,22 @@ def _load_project_breakdown(project_breakdown_filename:str,
             elif (isinstance(cell.value, int) or isinstance(cell.value, str)) and int(cell.value) >= 2000 and int(cell.value) <= 2100:
                 # The column seems to be a year...
                 year_columns[int(cell.value)] = cell.column
-            else:
-                logger.warning(f"Ignoring unknown column with header {cell.column} (='{cell.value}' /{type(cell.value)}) in worksheet {employee}.")
+            elif cell.value:
+                logger.warning(
+                    f"Ignoring unknown column with header {cell.column} (='{cell.value}' /{type(cell.value)}) in worksheet {employee}.")
 
     # NOTE: internally work with minutes...
     max_daily_limit = float(defaults['max-daily-limit'])*60
 
     logger.debug(f"Extracting projects config ...")
     # The map { project_name -> Project }
-    projects = { }
+    projects = {}
 
     # Each row is a project ...
     for i in range(worksheet.min_row+1, worksheet.max_row+1):
 
-        project = _load_project_base_info(worksheet, employee, i, name_col_idx, start_col_idx, end_col_idx, year_columns, justification_year, only_projects)
+        project = _load_project_base_info(worksheet, employee, i, name_col_idx,
+                                          start_col_idx, end_col_idx, year_columns, justification_year, only_projects)
         if not project:
             # Reached the end of the list of project
             continue
@@ -353,39 +432,33 @@ def _load_project_breakdown(project_breakdown_filename:str,
         # The project has some projected dedication for the justification_year
         if project.projected > 0:
             logger.debug(f"Loading config for project '{project.name}' ...")
-            project_working_days = list(filter(lambda d: project.start <= d and d <= project.end, working_days))
-            if len(project_working_days) <= 0:
-                raise ValueError (f"Invalid project breakdown: project '{project.name}' has projected dedication ({int(project.projected)}'), but no working days. It is configured to start on the {f(project.start)} and finish on the {f(project.end)}.")
-            project_daily_average = project.projected / len(project_working_days)
-            assert project_daily_average < max_daily_limit, f"Project daily average ({project_daily_average}) is greater the max daily limit ({max_daily_limit})"
+            project_working_days, project_daily_average = _get_project_working_days(
+                project, working_days, max_daily_limit)
 
-            # Calculate the limit for each interval
             if justification_interval == MONTH_INTERVAL:
                 number_of_interval = 12
-                project.interval_limits = [0] * number_of_interval
-                # Since not all months are equals, calculate a per interval limit
-                for i in range(0, number_of_interval):
-                    start = project.start.replace(year=justification_year, month=i+1, day=1)
-                    end = start + relativedelta(months=+1, days=-1)
-                    if not project.is_open(start) and not project.is_open(end):
-                        logger.debug(f"Project '{project.name}' is not opened in interval {f(start)} / {f(end)}. Skipping hints ...")
-                        continue
-                    default_interval_limit = int(round(_get_interval_limit(project_working_days, start, end, project_daily_average)))
-                    hint = hints.get(project.name, {}).get(i, None)
-                    if hint:
-                        # If an hint was specified, *must* respect it.
-                        logger.debug(f"Overriding default dedication for project {project.name} for {f(start)}: from {default_interval_limit} to {hint}")
-                        project.respect_hints = True
-                        project.interval_limits[i] = hint
-                    else:
-                        project.interval_limits[i] = default_interval_limit
             elif justification_interval == WEEK_INTERVAL:
-                assert False, "NOT IMPLEMENTED"
+                number_of_interval = 52
             else:
-                raise ValueError(f"Invalid '--justification-interval' parameter. Must be either 'month' or 'week'.")
+                raise ValueError(
+                    f"Invalid '--justification-interval' parameter. Must be either 'month' or 'week'.")
+
+            # Calculate the limit for each interval
+            project.interval_limits = [0] * number_of_interval
+            # Start from the first weekday of the year...
+            for i in range(0, number_of_interval):
+                start, end = _get_interval_dates(
+                    justification_year, justification_interval, i)
+                if not project.is_open(start) and not project.is_open(end):
+                    logger.debug(
+                        f"Project '{project.name}' is not opened in interval {f(start)} / {f(end)}. Skipping hints ...")
+                    continue
+                _set_interval_limit(
+                    project, project_working_days, hints, start, end, i, project_daily_average)
             projects[project.name] = project
         else:
-            logger.debug(f"Skipping project '{project.name}': not opened in any interval of {justification_year}.")
+            logger.debug(
+                f"Skipping project '{project.name}': not opened in any interval of {justification_year}.")
 
     return projects
 
@@ -403,15 +476,17 @@ def _get_justifiation_dates(interval, period):
     """
     if interval == MONTH_INTERVAL:
         start = period.replace(day=1)
-        end = period.replace(day=calendar.monthrange(start.year, start.month)[1])
+        end = period.replace(day=calendar.monthrange(
+            start.year, start.month)[1])
     else:
         start = period - timedelta(days=period.weekday())
-        end = period + timedelta(days=6-period.weekday()) 
+        end = period + timedelta(days=6-period.weekday())
     return start, end
 
 
-def _is_last_business_day_in_month(working_day:date) -> bool:
-    last_day = working_day.replace(max(calendar.monthcalendar(working_day.year, working_day.month)[-1][:5]))
+def _is_last_business_day_in_month(working_day: date) -> bool:
+    last_day = working_day.replace(
+        max(calendar.monthcalendar(working_day.year, working_day.month)[-1][:5]))
     return last_day == working_day
 
 
@@ -426,9 +501,10 @@ def _get_working_days(justification_start, holidays):
         list(date): the list of working days
     """
     # ok, I always justify a full year and then extract the intersting period.
-    # This is due to the fact that we do not want to justify periods that are not a multiple of the 
+    # This is due to the fact that we do not want to justify periods that are not a multiple of the
     # justification granulariry. Only during the last period of the year, is this allowed.
-    logger.debug(f"Creating the holiday calendar for Aragon in {justification_start.year} ...")
+    logger.debug(
+        f"Creating the holiday calendar for Aragon in {justification_start.year} ...")
     work_calendar = Aragon()
     # With the holiday calendar I create the list of the opened days in the justification year
     holidays = holidays.split(",")
@@ -442,7 +518,16 @@ def _get_working_days(justification_start, holidays):
     return working_days, work_calendar
 
 
-def _set_cell_to_time(cell:Cell, minutes:float):
+def _set_cell_to_title(cell: Cell, title: str, defaults:dict):
+    cell.value = title
+    try:
+        cell.style = defaults['project-report-interval-title-style']
+    except:
+        logger.warning(
+            f"Invalid configuration 'project-report-interval-title-style': Missing named style '{defaults['project-report-interval-title-style']}' in Excel file. Check your defaults.yaml.")
+    
+
+def _set_cell_to_time(cell: Cell, minutes: float):
     """Set the value of the given cell 
 
     Args:
@@ -450,7 +535,7 @@ def _set_cell_to_time(cell:Cell, minutes:float):
         minutes (float): _description_
     """
     if PREFERRED_FMT == 'decimal':
-        cell.value = minutes/60 
+        cell.value = minutes/60
         cell.number_format = "0.0"
     else:
         # Excel processes time entries as a decimal fraction of a day
@@ -458,19 +543,20 @@ def _set_cell_to_time(cell:Cell, minutes:float):
         cell.number_format = "[h]:mm"
 
 
-def _set_cell_to_project_name(cell:Cell, project:str, defaults:dict):
+def _set_cell_to_project_name(cell: Cell, project: str, defaults: dict):
     if defaults['project-report-use-reference']:
         cell.value = f"={project.name_coord}"
     else:
         cell.value = project.name
     cell.protection = Protection(locked=True)
     try:
-        cell.style = defaults['project-report-project-style']
+        cell.style = defaults['project-report-project-name-style']
     except:
-        logger.warning(f"Invalid configuration 'project-report-project-style': Missing named style '{defaults['project-report-project-style']}' in Excel file. Check your defaults.yaml.")
+        logger.warning(
+            f"Invalid configuration 'project-report-project-name-style': Missing named style '{defaults['project-report-project-name-style']}' in Excel file. Check your defaults.yaml.")
 
 
-def _set_cell_to_projected_dedication(cell:Cell, project:Project, defaults:dict):
+def _set_cell_to_projected_dedication(cell: Cell, project: Project, defaults: dict):
     if defaults['project-report-use-reference']:
         cell.value = f"={project.projected_coord}"
     else:
@@ -479,28 +565,30 @@ def _set_cell_to_projected_dedication(cell:Cell, project:Project, defaults:dict)
     cell.protection = Protection(locked=True)
 
 
-def _set_cell_to_justified_dedication(cell:Cell, named_range_name:str, defaults:dict):
+def _set_cell_to_justified_dedication(cell: Cell, named_range_name: str, defaults: dict):
     cell.value = f"=SUM({named_range_name})"
     cell.number_format = CELL_FMT
 
 
-def _set_cell_to_total(cell:Cell, named_range_name:str, defaults:dict):
+def _set_cell_to_total(cell: Cell, named_range_name: str, defaults: dict):
     cell.value = f"=SUM({named_range_name})"
     cell.number_format = CELL_FMT
-    
 
-def _safe_named_range_name(name:str) -> str:
+
+def _safe_named_range_name(name: str) -> str:
     return re.sub('[^0-9a-zA-Z_]+', '', name).lower()
 
 
-def _add_named_range(worksheet, name:str, cell_range:str) -> str:
-    named_range = DefinedName(_safe_named_range_name(name), attr_text=_get_cell_coordinate(worksheet, cell_range))
+def _add_named_range(worksheet, name: str, cell_range: str) -> str:
+    named_range = DefinedName(_safe_named_range_name(
+        name), attr_text=_get_cell_coordinate(worksheet, cell_range))
     worksheet.defined_names.add(named_range)
     return named_range
 
 
-def _get_month_col(month_1st_col:str, month:int) -> int:
-    return chr(ord(month_1st_col) + month - 1)
+def _get_interval_col(interval_1st_col: str, i: int) -> int:
+    assert interval_1st_col == WEEK_1ST_COL or interval_1st_col == MONTH_1ST_COL
+    return get_column_letter(column_index_from_string(interval_1st_col)+i-1)
 
 
 def _pick_best_open_project(open_projects, current_interval, daily_available, granularity):
@@ -525,21 +613,44 @@ def _pick_best_open_project(open_projects, current_interval, daily_available, gr
     # NOTE: in order to reverse sort by end project date, we need to
     #   create a pivot date
     pivot = date(2000, 1, 1)
-    by_availability = list(filter(lambda t: t[2] != 0, list(map(lambda project: (project, project.respect_hints, project.get_availability(daily_available, granularity, current_interval), pivot - project.end.date(), project.name), open_projects))))
+    by_availability = list(filter(lambda t: t[2] != 0, list(map(lambda project: (project, project.respect_hints, project.get_availability(
+        daily_available, granularity, current_interval), pivot - project.end.date(), project.name), open_projects))))
     # logger.debug(f"by_availability={pformat(by_availability, compact=True)}")
     if len(by_availability) == 0:
         return None, None
-    by_availability_sorted = sorted(by_availability, key=lambda x: (x[1], x[2], x[3], x[4]))
+    by_availability_sorted = sorted(
+        by_availability, key=lambda x: (x[1], x[2], x[3], x[4]))
     # logger.debug(f"by_availability_sorted={pformat(by_availability_sorted, compact=True)}")
     t = by_availability_sorted[-1]
     return t[0], t[2]
 
 
-def _generate_report(employee, project_breakdown:str, projects:dict, working_days, daily_dedications, justification_year:int, defaults:dict):
+def _get_interval(interval:str, d:datetime):
+    if interval == MONTH_INTERVAL:
+        return d.month
+    if interval == WEEK_INTERVAL:
+        return d.isocalendar().week
+    assert False
+
+
+def _is_new_interval(interval: str, d: datetime, i: int):
+    month = d.month
+    week = d.isocalendar().week
+    if not i:
+        return True, month if interval == MONTH_INTERVAL else week
+    if (interval == MONTH_INTERVAL and i != month):
+        return True, month
+    if (interval == WEEK_INTERVAL and i != week):
+        return True, week
+    return False, i
+
+
+def _generate_report(employee, project_breakdown: str, projects: dict, working_days, daily_dedications, justification_year: int, justification_interval:str, defaults: dict):
     logger.info("Generating report ...")
     workbook = openpyxl.load_workbook(project_breakdown, keep_vba=True)
     if defaults['worksheet-report-template'] not in workbook:
-        raise ValueError(f"Invalid configuration: No worksheet '{defaults['worksheet-report-template']}' found in {project_breakdown}.")
+        raise ValueError(
+            f"Invalid configuration: No worksheet '{defaults['worksheet-report-template']}' found in {project_breakdown}.")
     report_template = workbook[defaults['worksheet-report-template']]
 
     report_title = f"{employee} - {justification_year}"
@@ -568,14 +679,34 @@ def _generate_report(employee, project_breakdown:str, projects:dict, working_day
         for project_name, justified in project_dedications.items():
             if project_name not in justifications.keys():
                 justifications[project_name] = {}
-            if working_day.month not in justifications[project_name]:
-                justifications[project_name][working_day.month] = 0
-            justifications[project_name][working_day.month] += justified
+            interval = _get_interval(justification_interval, working_day)
+            if interval not in justifications[project_name]:
+                justifications[project_name][interval] = 0
+            justifications[project_name][interval] += justified
 
     logger.debug(f"justifications={pformat(justifications)}")
     # TODO: Way too much magic numbers! Indices are way too fragile! How to improve templating?
 
+    interval_1st_col = MONTH_1ST_COL if justification_interval == MONTH_INTERVAL else WEEK_1ST_COL
+    interval_lst_col = MONTH_LST_COL if justification_interval == MONTH_INTERVAL else WEEK_LST_COL
+    max_range = 12 if justification_interval == MONTH_INTERVAL else 52
 
+    #
+    # Header of the justification period
+    #
+    first = date.today().replace(year=justification_year, month=1, day=1)
+    for i in range(1, max_range+1):
+        interval_column = _get_interval_col(interval_1st_col, i)
+        title = first.replace(month=i).strftime("%B") if justification_interval == MONTH_INTERVAL else f"Week {i}"
+        _set_cell_to_title(report[f"{interval_column}{INTERVAL_HEADER_ROW}"], title, defaults)
+    try:
+        for cell in report[f"{INTERVAL_HEADER_ROW}:{INTERVAL_HEADER_ROW}"]:
+            cell.style = defaults['project-report-interval-title-style']
+    except: None
+
+    #
+    # The report for the projects
+    #
     for i, project_name in enumerate(sorted(justifications.keys())):
 
         project_row = PRJ_1ST_ROW + i
@@ -586,7 +717,7 @@ def _generate_report(employee, project_breakdown:str, projects:dict, working_day
         # let's set a couple of ranges
         _add_named_range(report, f"prj_total_projected_{project_name}", f"{PROJECTED_COL}{project_row}")
         _add_named_range(report, f"prj_total_justified_{project_name}", f"{JUSTIFIED_COL}{project_row}")
-        _add_named_range(report, f"prj_monthly_justified_{project_name}", f"{MONTH_1ST_COL}{project_row}:{MONTH_LST_COL}{project_row}")
+        _add_named_range(report, f"prj_{justification_interval}_justified_{project_name}", f"{interval_1st_col}{project_row}:{interval_lst_col}{project_row}")
 
         # Set the project name
         _set_cell_to_project_name(report[f"{PRJ_NAME_COL}{project_row}"], project, defaults)
@@ -595,15 +726,15 @@ def _generate_report(employee, project_breakdown:str, projects:dict, working_day
         _set_cell_to_projected_dedication(report[f"{PROJECTED_COL}{project_row}"], project, defaults)
 
         # The 'Horas justificadas' for that project (utilizamos la SUM de Excel como comprobacion)
-        _set_cell_to_justified_dedication(report[f"{JUSTIFIED_COL}{project_row}"], _safe_named_range_name(f"prj_monthly_justified_{project_name}"), defaults)
+        _set_cell_to_justified_dedication(report[f"{JUSTIFIED_COL}{project_row}"], _safe_named_range_name(f"prj_{justification_interval}_justified_{project_name}"), defaults)
 
-        # The justified time for each month
-        for month in range (1,13):
+        # The justified time for each interval
+        for i in range(1, max_range+1):
             justified = 0
-            if month in justifications[project_name]:
-                justified = justifications[project_name][month]
-            month_column = _get_month_col(MONTH_1ST_COL, month)
-            _set_cell_to_time(report[f"{month_column}{project_row}"], justified)
+            if i in justifications[project_name]:
+                justified = justifications[project_name][i]
+            interval_column = _get_interval_col(interval_1st_col, i)
+            _set_cell_to_time(report[f"{interval_column}{project_row}"], justified)
 
     #
     # 'Total proyectos' row
@@ -620,11 +751,11 @@ def _generate_report(employee, project_breakdown:str, projects:dict, working_day
     _set_cell_to_total(report[f"{JUSTIFIED_COL}{totals_row}"], "all_prj_justified", defaults)
 
     # 'Total proyectos' / Month
-    for month in range (1,13):
-        month_column = _get_month_col(MONTH_1ST_COL, month)
-        named_range_name = _safe_named_range_name(f"all_prj_monthly_justified_{month}")
-        _add_named_range(report, named_range_name, f"{month_column}{PRJ_1ST_ROW}:{month_column}{project_row}")
-        _set_cell_to_total(report[f"{month_column}{totals_row}"], named_range_name, defaults)
+    for i in range(1, max_range+1):
+        interval_column = _get_interval_col(interval_1st_col, i)
+        named_range_name = _safe_named_range_name(f"all_prj_{justification_interval}_justified_{i}")
+        _add_named_range(report, named_range_name,f"{interval_column}{PRJ_1ST_ROW}:{interval_column}{project_row}")
+        _set_cell_to_total(report[f"{interval_column}{totals_row}"], named_range_name, defaults)
 
     #
     # 'Limites mensuales' row
@@ -632,36 +763,43 @@ def _generate_report(employee, project_breakdown:str, projects:dict, working_day
     # We write the maximum number of hours for this month MAX_DAILY_LIMIT*monthly_working_days
     MAX_DAILY_LIMIT = float(defaults['max-daily-limit'])*60
     limits_row = totals_row+1
-    for month in range (1,13):
-        month_column = _get_month_col(MONTH_1ST_COL, month)
-        monthly_working_days = list(filter(lambda d: d.month == month, working_days))
-        monthly_limit = MAX_DAILY_LIMIT * len(monthly_working_days)
-        _set_cell_to_time(report[f"{month_column}{limits_row}"], monthly_limit)
+    for i in range(1, max_range+1):
+        interval_column = _get_interval_col(interval_1st_col, i)
+        interval_working_days = list(filter(lambda d: _get_interval(justification_interval, d) == i, working_days))
+        interval_limit = MAX_DAILY_LIMIT * len(interval_working_days)
+        _set_cell_to_time(report[f"{interval_column}{limits_row}"], interval_limit)
 
-    alert_color=defaults['project-report-alert-color']
-    warning_color=defaults['project-report-warning-color']
-    ok_color=defaults['project-report-ok-color']
-    grey_color=defaults['project-report-grey-color']
+    try:
+        for row in report[f"A{totals_row}:A{limits_row}"]:
+            for cell in row:    
+                cell.style = defaults['project-report-interval-title-style']
+    except: None
+        
+
+    alert_color = defaults['project-report-alert-color']
+    warning_color = defaults['project-report-warning-color']
+    ok_color = defaults['project-report-ok-color']
+    grey_color = defaults['project-report-grey-color']
 
     # Doing some more formatting
     # Set the project's monthly dedication in grey if it is 0
     fill = PatternFill(bgColor=grey_color)
     rule = CellIsRule(operator='equal', formula=['0'], stopIfTrue=True, fill=fill)
-    report.conditional_formatting.add(f"{MONTH_1ST_COL}{PRJ_1ST_ROW}:{MONTH_LST_COL}{project_row}", rule)
+    report.conditional_formatting.add(f"{interval_1st_col}{PRJ_1ST_ROW}:{interval_lst_col}{project_row}", rule)
 
     # BEWARE: The conditional formatting syntax is slightly different from the formula syntax. It uses ',' instead of ';'
     # Set the monthly justified dedication in red/yellow/green if it breaches the monthly limit (row offset = 1)
     fill = PatternFill(bgColor=alert_color)
     rule = FormulaRule(formula=['INDIRECT("RC",FALSE) > OFFSET(INDIRECT("RC",FALSE),1,0)'], stopIfTrue=True, fill=fill)
-    report.conditional_formatting.add(f"{MONTH_1ST_COL}{totals_row}:{MONTH_LST_COL}{totals_row}", rule)
+    report.conditional_formatting.add(f"{interval_1st_col}{totals_row}:{interval_lst_col}{totals_row}", rule)
 
     fill = PatternFill(bgColor=warning_color)
     rule = FormulaRule(formula=['INDIRECT("RC",FALSE) = OFFSET(INDIRECT("RC",FALSE),1,0)'], stopIfTrue=True, fill=fill)
-    report.conditional_formatting.add(f"{MONTH_1ST_COL}{totals_row}:{MONTH_LST_COL}{totals_row}", rule)
+    report.conditional_formatting.add(f"{interval_1st_col}{totals_row}:{interval_lst_col}{totals_row}", rule)
 
     fill = PatternFill(bgColor=ok_color)
     rule = FormulaRule(formula=['INDIRECT("RC",FALSE) < OFFSET(INDIRECT("RC",FALSE),1,0)'], stopIfTrue=True, fill=fill)
-    report.conditional_formatting.add(f"{MONTH_1ST_COL}{totals_row}:{MONTH_LST_COL}{totals_row}", rule)
+    report.conditional_formatting.add(f"{interval_1st_col}{totals_row}:{interval_lst_col}{totals_row}", rule)
 
     # Set the project's total justified dedication in red/yellow/green if it breaches the projected limit (col offset = -1)
     fill = PatternFill(bgColor=alert_color)
@@ -689,7 +827,8 @@ def _generate_report(employee, project_breakdown:str, projects:dict, working_day
     try:
         workbook.save(defaults['project-report'])
     except PermissionError:
-        logger.error(f"Can't write '{defaults['project-report']}'. Is it open in Excel?")
+        logger.error(
+            f"Can't write '{defaults['project-report']}'. Is it open in Excel?")
 
 
 def distribute_hours(args):
@@ -698,45 +837,55 @@ def distribute_hours(args):
     MAX_YEARLY_LIMIT = float(args.defaults['max-yearly-limit'])*60
     granularity = float(args.justification_granularity)*60
     # Some sanity checks ...
-    assert (MAX_DAILY_LIMIT >= granularity), f"Invalid configuration: daily limit ({int(MAX_DAILY_LIMIT)}') must be superior to justification granularity ({int(granularity)}')."
-    assert (MAX_DAILY_LIMIT % granularity) == 0, f"Invalid configuration: daily limit ({int(MAX_DAILY_LIMIT)}') must be a multiple of the justification granularity ({int(granularity)}')."
-    assert (MAX_YEARLY_LIMIT % granularity) == 0, f"Invalid configuration: yearly limit ({int(MAX_YEARLY_LIMIT)}') must be a multiple of the justification granularity ({int(granularity)}')."
+    assert (MAX_DAILY_LIMIT >=
+            granularity), f"Invalid configuration: daily limit ({int(MAX_DAILY_LIMIT)}') must be superior to justification granularity ({int(granularity)}')."
+    assert (MAX_DAILY_LIMIT %
+            granularity) == 0, f"Invalid configuration: daily limit ({int(MAX_DAILY_LIMIT)}') must be a multiple of the justification granularity ({int(granularity)}')."
+    assert (MAX_YEARLY_LIMIT %
+            granularity) == 0, f"Invalid configuration: yearly limit ({int(MAX_YEARLY_LIMIT)}') must be a multiple of the justification granularity ({int(granularity)}')."
 
-    justification_start, justification_end = _get_justifiation_dates(args.justification_interval, args.justification_period)
+    justification_start, justification_end = _get_justifiation_dates(
+        args.justification_interval, args.justification_period)
     justification_year = justification_start.year
-    holidays = ','.join([args.defaults['university-holidays'], args.employee_holidays])
-    working_days, work_calendar = _get_working_days(justification_start, holidays)
-
+    holidays = ','.join(
+        [args.defaults['university-holidays'], args.employee_holidays])
+    working_days, work_calendar = _get_working_days(
+        justification_start, holidays)
 
     # Load project breakdown for employee ...
-    projects = _load_project_breakdown(args.project_breakdown, 
-        args.employee, 
-        args.only_projects, 
-        args.justification_interval, 
-        args.use_justification_hints,
-        justification_year, 
-        working_days,
-        args.defaults)
-    
-    logger.info(f"Justifying '{args.justification_interval}' interval from '{justification_start}' to '{justification_end}' ...")
-    logger.debug(f"{str(justification_year)} has {len(working_days)} working day(s)")
+    projects = _load_project_breakdown(args.project_breakdown,
+                                       args.employee,
+                                       args.only_projects,
+                                       args.justification_interval,
+                                       args.use_justification_hints,
+                                       justification_year,
+                                       working_days,
+                                       args.defaults)
+
+    logger.info(f"Justifying '{args.justification_interval}' interval "
+                f"from '{f(justification_start)}' to '{f(justification_end)}' ...")
+    logger.debug(
+        f"{str(justification_year)} has {len(working_days)} working day(s)")
 
     # A map of working days with the project and the corresponding justified time
-    daily_dedications = { working_day: {} for working_day in working_days }
+    daily_dedications = {working_day: {} for working_day in working_days}
 
     current_interval = None
     for working_day in working_days:
         # Reset the project justified dedication when changing interval (month/week)
-        if not current_interval or current_interval != working_day.month:
-            current_interval = working_day.month
-            logger.debug(f"New {args.justification_interval} ({current_interval}) detected. Resetting projects EOI dedication ...")
-            list(map(lambda p: setattr(p, 'justified', 0), projects.values()))
+        is_new_interval, new_interval = _is_new_interval(
+            args.justification_interval, working_day, current_interval)
+        if is_new_interval:
+            current_interval = new_interval
+            logger.debug(f"New {args.justification_interval} ({current_interval}) detected. "
+                         "Resetting projects EOI dedication ...")
+            list(map(lambda p: setattr(p, 'justified_eoi', 0), projects.values()))
             logger.debug(f"projects={pformat(list(projects.values()))}")
-
 
         # List projects that still need to be justified for that day.
         # NOTE: that a project can be opened in the middle of the year.
-        open_projects = list(filter(lambda p: p.is_open(working_day) and not p.is_full(current_interval), projects.values()))
+        open_projects = list(filter(lambda p: p.is_open(
+            working_day) and not p.is_full(current_interval), projects.values()))
         if len(open_projects) == 0:
             logger.debug(f"No project left opened on {f(working_day)}")
             continue
@@ -745,28 +894,40 @@ def distribute_hours(args):
         while daily_dedication < MAX_DAILY_LIMIT:
             # Find the project that has the biggest available time slot for the day.
             # Projects that have respect_hints set to True take precedence.
-            project, available = _pick_best_open_project(open_projects, current_interval, MAX_DAILY_LIMIT - daily_dedication, granularity)
+            project, available = _pick_best_open_project(
+                open_projects, current_interval, MAX_DAILY_LIMIT - daily_dedication, granularity)
             if not project:
-                logger.debug(f"No more time can be justified on {f(working_day)}. Skipping to next day.")
+                logger.debug(f"No more time can be justified on {f(working_day)}."
+                             "Skipping to next day.")
                 break
-            logger.debug(f"Justifying {available}' to project {project.name} on {f(working_day)}")
+            logger.debug(
+                f"Adding {available}' to project {project.name} on {f(working_day)}")
 
             daily_dedication += available
-            project.justified += available
+            project.justified_eoi += available
             project.justified_eoy += available
             daily_dedications[working_day][project.name] = available
-            
+
             assert project.justified_eoy <= project.projected, f"Project justified dedication to date ({int(project.justified_eoy)}') is superior to projected dedication ({int(project.projected)}') for project {project.name}"
 
     # I check whether some projects were left with some projected time in each interval.
     # That would be a signal that not all hours could be squeezed in the given interval.
-    open_projects = list(filter(lambda p: p.is_open(working_day) and not p.is_full(current_interval), projects.values()))
+    open_projects = list(filter(lambda p: p.is_open(
+        working_day) and not p.is_full(current_interval), projects.values()))
     if len(open_projects) != 0 and _is_last_business_day_in_month(working_day):
-        logger.warning(f"Reached the end of the month with some project left opened {f(working_day)}")
+        logger.warning(
+            f"Reached the end of the month with some project left opened {f(working_day)}")
 
     logger.debug(f"daily_dedications={pformat(daily_dedications)}")
 
-    _generate_report(args.employee, args.project_breakdown, projects, working_days, daily_dedications, justification_year, args.defaults)
+    _generate_report(args.employee,
+                     args.project_breakdown,
+                     projects,
+                     working_days,
+                     daily_dedications,
+                     justification_year,
+                     args.justification_interval,
+                     args.defaults)
 
 
 def parse_command_line(defaults):
@@ -816,5 +977,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
-
